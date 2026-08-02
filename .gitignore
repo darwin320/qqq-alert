@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Local TLS workaround. Contains the machine's root store, including the
+# interception root the antivirus installs. Never commit it: CI does not
+# need it and must not trust it.
+tools/ca-bundle-local.pem

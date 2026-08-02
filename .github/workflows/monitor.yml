@@ -1,0 +1,48 @@
+name: monitor
+
+on:
+  # Every 30 minutes, weekdays. Cron here is UTC: 13-21 covers the US cash
+  # session in both EDT (13:30-20:00) and EST (14:30-21:00). Runs that land
+  # outside the session just report the last close and alert nothing.
+  # GitHub schedules are best effort and can be delayed under load.
+  schedule:
+    - cron: '*/30 13-21 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Print only, do not notify'
+        type: boolean
+        default: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Check prices
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          SYMBOLS: ${{ vars.SYMBOLS || 'QQQ' }}
+          DAILY_DROP: ${{ vars.DAILY_DROP || '2.0' }}
+          DRAWDOWN: ${{ vars.DRAWDOWN || '8.0' }}
+          PEAK_DAYS: ${{ vars.PEAK_DAYS || '60' }}
+        run: python monitor.py ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      - name: Persist alert state
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add state.json
+          git diff --staged --quiet || git commit -m 'chore: update alert state'
+          git push
