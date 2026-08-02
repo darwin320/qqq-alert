@@ -104,17 +104,14 @@ def parse_specs(raw, default_drop, default_drawdown):
     return specs
 
 
-def latest_tick(ticker):
-    """Last traded price including pre- and post-market, or None."""
+def intraday_bars(ticker):
+    """Minute bars for the last few days including pre- and post-market."""
     try:
         bars = ticker.history(period="5d", interval="1m", prepost=True, auto_adjust=False)
     except Exception as exc:  # network hiccup: fall back to the daily bar
         print(f"  (extended-hours lookup failed: {exc})")
         return None
-    if bars.empty:
-        return None
-    stamp = bars.index[-1]
-    return stamp, float(bars["Close"].iloc[-1])
+    return None if bars.empty else bars
 
 
 def measure(symbol, peak_days, extended=True):
@@ -130,11 +127,13 @@ def measure(symbol, peak_days, extended=True):
     session_date = daily_date
     phase = "regular close"
     as_of = None
+    session_low = None
 
     if extended:
-        tick = latest_tick(ticker)
-        if tick and tick[0].date() >= daily_date:
-            as_of, price = tick
+        bars = intraday_bars(ticker)
+        if bars is not None and bars.index[-1].date() >= daily_date:
+            as_of = bars.index[-1]
+            price = float(bars["Close"].iloc[-1])
             session_date = as_of.date()
             clock = as_of.time()
             if clock < MARKET_OPEN:
@@ -143,6 +142,24 @@ def measure(symbol, peak_days, extended=True):
                 phase = "after-hours"
             else:
                 phase = "regular session"
+            # Lowest print of the session so far, extended hours included. A
+            # dip that recovers between two 30-minute checks is invisible to
+            # the spot price but shows up here: in 2026 QQQ touched -2% on 24
+            # days and only closed there on 6.
+            #
+            # Yahoo's extended-hours minute bars report Volume 0 and their Low
+            # is not trustworthy: on 2026-07-31 17:32 one printed Low 667.36
+            # with its own Close at 684.98 and both neighbours near 684.8, a
+            # phantom -2.4% that would have fired a false alert. The Close of
+            # those bars does track. So trust Low only where volume proves a
+            # trade happened, and fall back to Close everywhere else.
+            today_bars = bars[bars.index.date == session_date]
+            if not today_bars.empty:
+                traded = today_bars[today_bars["Volume"] > 0]
+                lows = [float(today_bars["Close"].min())]
+                if not traded.empty:
+                    lows.append(float(traded["Low"].min()))
+                session_low = min(lows)
 
     # A tick from a session the daily bars do not have yet means the regular
     # session has not opened: the reference close is the last daily bar, and
@@ -180,6 +197,10 @@ def measure(symbol, peak_days, extended=True):
         "peak_close": peak_close,
         "peak_date": peak_date.isoformat(),
         "from_peak": (price / peak_close - 1.0) * 100.0,
+        "session_low": session_low,
+        "low_vs_prev": (
+            None if session_low is None else (session_low / prev_close - 1.0) * 100.0
+        ),
     }
 
 
@@ -205,20 +226,32 @@ def split_text(m):
     return f"gap {m['gap']:+.2f}% + intradia {m['intraday']:+.2f}%"
 
 
-def evaluate(m, daily_drop, drawdown, rearm, state, force):
+def worst_move(m, use_low):
+    """The drop rule 1 is judged on: the spot price, or the deepest print of
+    the session when low mode is on."""
+    if use_low and m["low_vs_prev"] is not None:
+        return min(m["vs_prev_close"], m["low_vs_prev"])
+    return m["vs_prev_close"]
+
+
+def evaluate(m, daily_drop, drawdown, rearm, state, force, use_low=False):
     """Return the list of (state_key, state_value, title, body, priority, tags)."""
     key = lambda rule: f"{m['symbol']}:{rule}"  # noqa: E731
     fired = []
 
     # Rule 1: once per session.
-    if m["vs_prev_close"] <= -daily_drop:
+    move = worst_move(m, use_low)
+    if move <= -daily_drop:
         if force or state.get(key("daily_drop")) != m["session"]:
+            recovered = ""
+            if move < m["vs_prev_close"] - 0.05:
+                recovered = f"\nahora va en {m['vs_prev_close']:+.2f}%"
             fired.append((
                 key("daily_drop"),
                 m["session"],
-                f"{m['symbol']} {m['vs_prev_close']:+.2f}% ({m['phase']})",
+                f"{m['symbol']} {move:+.2f}% ({m['phase']})",
                 f"{m['price']:.2f} contra cierre previo {m['prev_close']:.2f}\n"
-                f"{split_text(m)}\n"
+                f"{split_text(m)}{recovered}\n"
                 f"{m['from_peak']:+.1f}% desde el max de {m['peak_date']}",
                 "default",
                 "chart_with_downwards_trend",
@@ -259,10 +292,16 @@ def main():
                    help="recovery above the drawdown line before rule 2 can fire again")
     p.add_argument("--no-extended", dest="extended", action="store_false",
                    help="ignore pre- and post-market trading")
+    p.add_argument("--no-use-low", dest="use_low", action="store_false",
+                   help="judge rule 1 on the spot price only, ignoring dips that "
+                        "already recovered")
     p.add_argument("--dry-run", action="store_true",
                    help="print, do not notify, do not save state")
     p.add_argument("--force", action="store_true", help="ignore dedup and notify anyway")
-    p.set_defaults(extended=env("EXTENDED", "1") not in ("0", "false", "no"))
+    p.set_defaults(
+        extended=env("EXTENDED", "1") not in ("0", "false", "no"),
+        use_low=env("USE_LOW", "1") not in ("0", "false", "no"),
+    )
     args = p.parse_args()
 
     topic = env("NTFY_TOPIC", "")
@@ -279,17 +318,24 @@ def main():
 
         stamp = m["as_of"] or m["session"]
         stale = "" if m["is_today"] else "   [ultima sesion disponible]"
+        low_line = ""
+        if m["low_vs_prev"] is not None:
+            flag = " <- se juzga por aqui" if args.use_low else " (informativo)"
+            low_line = (
+                f"\n  minimo sesion     {m['low_vs_prev']:+10.2f}%   "
+                f"({m['session_low']:.2f}){flag}"
+            )
         print(
             f"{m['symbol']}  {stamp}  {m['phase']}{stale}\n"
             f"  precio            {m['price']:10.2f}\n"
             f"  vs cierre previo  {m['vs_prev_close']:+10.2f}%   ({split_text(m)})"
-            f"   umbral {-daily_drop:.1f}%\n"
+            f"   umbral {-daily_drop:.1f}%{low_line}\n"
             f"  vs max {args.peak_days}d       {m['from_peak']:+10.2f}%   "
             f"(max {m['peak_close']:.2f} del {m['peak_date']})   umbral {-drawdown:.1f}%"
         )
 
         for state_key, state_value, title, body, priority, tags in evaluate(
-            m, daily_drop, drawdown, args.rearm, state, args.force
+            m, daily_drop, drawdown, args.rearm, state, args.force, args.use_low
         ):
             print(f"  ALERTA -> {title}")
             if args.dry_run:

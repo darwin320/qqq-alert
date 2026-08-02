@@ -62,6 +62,35 @@ problema del hueco es real pero no aplicaba a ese evento.
 
 Corre `python analyze.py` para regenerar estas cifras.
 
+## Modo minimo de sesion (USE_LOW, activado por defecto)
+
+La regla 1 se juzga sobre el **minimo de la sesion** contra el cierre previo, no
+sobre el precio del instante en que corre el chequeo. Sin esto, una caida que
+baja y se recupera entre dos chequeos de 30 minutos es invisible. Con datos de
+2026 la diferencia es grande:
+
+| QQQ en 2026 | Dias |
+|---|---|
+| Tocaron -2% en algun momento | 24 |
+| Cerraron en -2% o peor | 6 |
+
+Costo: mas avisos, y algunos llegan cuando el precio ya reboto. El mensaje lo
+dice explicitamente ("ahora va en -1.40%") para que no confundas el minimo con
+el precio actual. Se apaga con `USE_LOW=0` o `--no-use-low`.
+
+**Ojo con la frecuencia:** medido sobre el minimo, QQQ toca -2% unas 34 veces
+al anio (promedio de 5 anios), no 17.7. Si eso resulta ruidoso, el umbral que
+deja ~10 al anio en modo minimo es -3.0%.
+
+### El tick fantasma
+
+Las barras de horario extendido de Yahoo traen `Volume` en 0 y su `Low` no es
+confiable. Caso real: 2026-07-31 17:32 imprimio `Low` 667.36 con su propio
+`Close` en 684.98 y los dos vecinos en 684.8, un -2.4% inexistente que habria
+disparado una alerta falsa. El `Close` de esas barras si sigue al precio, asi
+que el minimo se calcula confiando en `Low` solo donde hubo volumen, y en
+`Close` en el resto.
+
 ## Elegir el umbral
 
 Frecuencia real medida sobre los mismos 5 anios:
@@ -105,7 +134,13 @@ acciones, indices, divisas, cripto.
 pip install -r requirements.txt
 python monitor.py --dry-run
 python analyze.py --symbol QQQ --years 5 --highlight 2026-07-29
+python candidates.py 5
 ```
+
+`candidates.py` mide que tickers vale la pena sumar al monitor: el umbral que
+da ~1 alerta al mes en cada uno, y sobre todo cuantas de esas alertas caen en
+un dia en que QQQ ya toco -2%. Un papel con 90% de solapamiento no te esta
+diciendo nada nuevo. No ordena nada como inversion, solo mide valor de senal.
 
 En Windows, si las llamadas HTTPS fallan con `unable to get local issuer
 certificate`, es el antivirus interceptando TLS. Se arregla una sola vez:
