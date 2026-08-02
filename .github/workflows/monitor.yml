@@ -40,6 +40,7 @@ jobs:
           DRAWDOWN: ${{ vars.DRAWDOWN || '8.0' }}
           PEAK_DAYS: ${{ vars.PEAK_DAYS || '60' }}
           EXTENDED: ${{ vars.EXTENDED || '1' }}
+          USE_LOW: ${{ vars.USE_LOW || '1' }}
         run: python monitor.py ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: Persist alert state
