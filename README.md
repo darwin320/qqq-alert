@@ -17,6 +17,29 @@ Dos reglas, porque miden cosas distintas:
    dispara al entrar en la caida, no cada 30 minutos mientras dure, y se vuelve
    a armar solo cuando el precio recupera pasando una banda de histeresis.
 
+## Los gaps: si, van incluidos, por dos vias
+
+**Primera: el gap esta dentro del numero.** La regla 1 mide contra el cierre
+de la ultima sesion regular completa, no contra la apertura del dia. Entonces
+todo lo que se movio el precio mientras el mercado estuvo cerrado ya esta
+adentro. El mensaje ademas lo desglosa en "gap + intradia" para que se vea de
+donde vino el movimiento.
+
+**Segunda: se ve el gap mientras se forma.** Por defecto el precio actual sale
+de datos extendidos (pre-market desde las 04:00 ET y after-hours hasta las
+20:00 ET), y el cron arranca a las 11:00 UTC. O sea que un desplome que
+empieza a las 07:00 ET avisa ahi, no a las 09:30 cuando abre la sesion
+regular. Se apaga con `--no-extended` o con la variable `EXTENDED=0`.
+
+La diferencia no es cosmetica. Con datos del 31 de julio de 2026:
+
+| Fuente del precio | QQQ | Distancia al maximo |
+|---|---|---|
+| Cierre regular | 687.99 | -7.80% |
+| Ultimo negociado (after-hours) | 684.47 | **-8.27%** |
+
+Con umbral de -8% el segundo dispara y el primero no.
+
 ## Por que se mide contra el cierre previo y no contra la apertura
 
 Porque medir desde la apertura del dia se pierde el hueco nocturno, y eso no es
@@ -62,6 +85,20 @@ Los valores por defecto son -2.0% y -8%, o sea unas 23 notificaciones al anio
 entre las dos reglas. Un umbral de -3% habria dejado pasar el 29 de julio de
 2026, que cayo -2.04%.
 
+**El umbral no se puede reciclar entre tickers.** El mismo -2% diario es un
+evento muy distinto segun el papel:
+
+| Umbral diario | QQQ | SPY |
+|---|---|---|
+| -1.5% | 30.9/anio | 17.9/anio |
+| -2.0% | 17.7/anio | 8.0/anio |
+| -3.0% | 6.0/anio | 2.2/anio |
+
+Por eso cada simbolo lleva los suyos: `SYMBOLS=QQQ:2.0:8.0,SPY:1.5:5.0`. El
+formato es `TICKER[:caida_diaria[:distancia_al_maximo]]`, y lo que se omite
+toma el default. Sirve cualquier ticker de Yahoo Finance, no solo ETFs:
+acciones, indices, divisas, cripto.
+
 ## Uso local
 
 ```
@@ -91,11 +128,18 @@ raiz.
 4. En el repo: Settings > Secrets and variables > Actions
    - Secret `NTFY_TOPIC` con el nombre del topic.
    - Opcional, como Variables: `SYMBOLS` (default `QQQ`), `DAILY_DROP`
-     (`2.0`), `DRAWDOWN` (`8.0`), `PEAK_DAYS` (`60`).
+     (`2.0`), `DRAWDOWN` (`8.0`), `PEAK_DAYS` (`60`), `EXTENDED` (`1`).
 5. Probar a mano en la pestania Actions con "Run workflow", marcando dry run.
 
-El workflow corre cada 30 minutos, de lunes a viernes, 13:00-21:00 UTC, que
-cubre la sesion de EEUU tanto en horario de verano como de invierno.
+El workflow corre cada 30 minutos, de lunes a viernes, 11:00-23:00 UTC: 26
+corridas por dia habil, unas 570 al mes. En repo publico los minutos de
+Actions son ilimitados. En repo privado salen de la cuota gratis de 2000
+minutos al mes, y esto consume del orden de 600, asi que cabe pero deja menos
+margen para otras cosas.
+
+Si el paso que guarda el estado falla con un error de permisos, revisar
+Settings > Actions > General > Workflow permissions y dejarlo en "Read and
+write permissions".
 
 ## Limitaciones que conviene saber
 

@@ -3,10 +3,13 @@
 Checks one or more tickers and sends a push notification when either of two
 things happens:
 
-  1. daily drop      - price is N% below the PREVIOUS SESSION CLOSE.
-                       This includes the overnight gap, which is the whole
-                       point: an alert measured from today's open would miss
-                       a fall that happened while the market was shut.
+  1. daily drop      - price is N% below the last COMPLETED regular session
+                       close. Measuring against that close instead of against
+                       today's open is what makes the overnight gap part of
+                       the number: an alert measured from the open ignores
+                       everything that happened while the market was shut, and
+                       on 5 years of QQQ that is half the events (see
+                       analyze.py).
   2. drawdown        - price is N% below the highest close of the last K
                        sessions. This is the "how far from the top are we"
                        signal, which is usually more informative than the
@@ -16,14 +19,27 @@ Rule 1 fires at most once per session. Rule 2 is latched: it fires on the
 transition into the drawdown, not every time it is checked, and re-arms only
 after the price recovers past a hysteresis band.
 
-Run it with --dry-run to see the numbers without notifying anything.
+By default the current price comes from extended-hours data, so a gap that
+forms before the opening bell is caught while it is forming rather than at
+09:30. Pass --no-extended to look only at the regular session.
+
+Thresholds can be set per symbol, because the same percentage is a very
+different event on different tickers: -2% in a day happens 17.7 times a year
+on QQQ and 8.0 times a year on SPY.
+
+    QQQ                 both thresholds from the defaults
+    QQQ:2.0             daily drop 2.0%
+    QQQ:2.0:8.0         daily drop 2.0%, drawdown 8.0%
+    QQQ:2.0:8.0,SPY:1.5 several symbols, each with its own
+
+Run with --dry-run to see the numbers without notifying anything.
 """
 
 import argparse
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +66,8 @@ import yfinance as yf  # noqa: E402
 
 NY = ZoneInfo("America/New_York")
 STATE_FILE = os.path.join(HERE, "state.json")
+MARKET_OPEN = dtime(9, 30)
+MARKET_CLOSE = dtime(16, 0)
 
 
 def env(name, default):
@@ -71,39 +89,94 @@ def save_state(state):
         fh.write("\n")
 
 
-def measure(symbol, peak_days):
+def parse_specs(raw, default_drop, default_drawdown):
+    """'QQQ:2.0:8.0,SPY' -> [(symbol, daily_drop, drawdown), ...]"""
+    specs = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split(":")
+        symbol = parts[0].strip().upper()
+        drop = float(parts[1]) if len(parts) > 1 and parts[1].strip() else default_drop
+        draw = float(parts[2]) if len(parts) > 2 and parts[2].strip() else default_drawdown
+        specs.append((symbol, drop, draw))
+    return specs
+
+
+def latest_tick(ticker):
+    """Last traded price including pre- and post-market, or None."""
+    try:
+        bars = ticker.history(period="5d", interval="1m", prepost=True, auto_adjust=False)
+    except Exception as exc:  # network hiccup: fall back to the daily bar
+        print(f"  (extended-hours lookup failed: {exc})")
+        return None
+    if bars.empty:
+        return None
+    stamp = bars.index[-1]
+    return stamp, float(bars["Close"].iloc[-1])
+
+
+def measure(symbol, peak_days, extended=True):
     """Return the current picture for one symbol, or None if there is no
     usable history."""
-    hist = yf.Ticker(symbol).history(
-        period=f"{peak_days + 40}d", interval="1d", auto_adjust=False
-    )
+    ticker = yf.Ticker(symbol)
+    hist = ticker.history(period=f"{peak_days + 40}d", interval="1d", auto_adjust=False)
     if len(hist) < 3:
         return None
 
-    last, prev = hist.iloc[-1], hist.iloc[-2]
-    session_date = hist.index[-1].date()
+    daily_date = hist.index[-1].date()
+    price = float(hist["Close"].iloc[-1])
+    session_date = daily_date
+    phase = "regular close"
+    as_of = None
 
-    price = float(last["Close"])
-    open_px = float(last["Open"])
-    prev_close = float(prev["Close"])
+    if extended:
+        tick = latest_tick(ticker)
+        if tick and tick[0].date() >= daily_date:
+            as_of, price = tick
+            session_date = as_of.date()
+            clock = as_of.time()
+            if clock < MARKET_OPEN:
+                phase = "pre-market"
+            elif clock >= MARKET_CLOSE:
+                phase = "after-hours"
+            else:
+                phase = "regular session"
 
-    # Peak over the trailing window, excluding the session in progress so a
-    # a new high today cannot silently reset the drawdown to zero.
-    window = hist["Close"].iloc[-(peak_days + 1):-1]
+    # A tick from a session the daily bars do not have yet means the regular
+    # session has not opened: the reference close is the last daily bar, and
+    # there is no open to split the move against.
+    pre_open = session_date > daily_date
+    if pre_open:
+        prev_close = float(hist["Close"].iloc[-1])
+        open_px = None
+        window = hist["Close"].iloc[-peak_days:]
+    else:
+        prev_close = float(hist["Close"].iloc[-2])
+        open_px = float(hist["Open"].iloc[-1])
+        # Exclude the session in progress so a new high today cannot silently
+        # reset the drawdown to zero.
+        window = hist["Close"].iloc[-(peak_days + 1):-1]
+
     peak_close = float(window.max())
     peak_date = window.idxmax().date()
+    vs_prev_close = (price / prev_close - 1.0) * 100.0
 
     return {
         "symbol": symbol,
         "session": session_date.isoformat(),
+        "phase": phase,
+        "as_of": as_of.isoformat() if as_of is not None else None,
         "is_today": session_date == datetime.now(NY).date(),
         "price": price,
-        "open": open_px,
         "prev_close": prev_close,
-        # The three ways of saying "it fell", which are NOT the same number.
-        "vs_prev_close": (price / prev_close - 1.0) * 100.0,
-        "vs_open": (price / open_px - 1.0) * 100.0,
-        "gap": (open_px / prev_close - 1.0) * 100.0,
+        # The whole move so far, gap included. This is the number rule 1 uses.
+        "vs_prev_close": vs_prev_close,
+        # Split into overnight and intraday, for context in the message. Before
+        # the opening bell the entire move is overnight by definition.
+        "gap": vs_prev_close if pre_open else (open_px / prev_close - 1.0) * 100.0,
+        "intraday": None if pre_open else (price / open_px - 1.0) * 100.0,
         "peak_close": peak_close,
         "peak_date": peak_date.isoformat(),
         "from_peak": (price / peak_close - 1.0) * 100.0,
@@ -114,24 +187,26 @@ def notify(topic, title, body, priority, tags):
     """Push through ntfy.sh. No account, no token: the topic name IS the
     address, so pick an unguessable one."""
     if not topic:
-        print("[no NTFY_TOPIC set, notification not sent]")
+        print("  [no NTFY_TOPIC set, notification not sent]")
         return False
     resp = requests.post(
         f"https://ntfy.sh/{topic}",
         data=body.encode("utf-8"),
-        headers={
-            "Title": title,
-            "Priority": priority,
-            "Tags": tags,
-        },
+        headers={"Title": title, "Priority": priority, "Tags": tags},
         timeout=20,
     )
     resp.raise_for_status()
     return True
 
 
+def split_text(m):
+    if m["intraday"] is None:
+        return f"todo fuera de sesion (gap {m['gap']:+.2f}%)"
+    return f"gap {m['gap']:+.2f}% + intradia {m['intraday']:+.2f}%"
+
+
 def evaluate(m, daily_drop, drawdown, rearm, state, force):
-    """Return the list of (rule, title, body, priority, tags) to send."""
+    """Return the list of (state_key, state_value, title, body, priority, tags)."""
     key = lambda rule: f"{m['symbol']}:{rule}"  # noqa: E731
     fired = []
 
@@ -141,9 +216,9 @@ def evaluate(m, daily_drop, drawdown, rearm, state, force):
             fired.append((
                 key("daily_drop"),
                 m["session"],
-                f"{m['symbol']} {m['vs_prev_close']:+.2f}% hoy",
-                f"{m['price']:.2f} (cierre previo {m['prev_close']:.2f})\n"
-                f"gap de apertura {m['gap']:+.2f}%, intradia {m['vs_open']:+.2f}%\n"
+                f"{m['symbol']} {m['vs_prev_close']:+.2f}% ({m['phase']})",
+                f"{m['price']:.2f} contra cierre previo {m['prev_close']:.2f}\n"
+                f"{split_text(m)}\n"
                 f"{m['from_peak']:+.1f}% desde el max de {m['peak_date']}",
                 "default",
                 "chart_with_downwards_trend",
@@ -157,7 +232,7 @@ def evaluate(m, daily_drop, drawdown, rearm, state, force):
             True,
             f"{m['symbol']} {m['from_peak']:.1f}% bajo su maximo",
             f"{m['price']:.2f} contra {m['peak_close']:.2f} del {m['peak_date']}\n"
-            f"hoy {m['vs_prev_close']:+.2f}%",
+            f"hoy {m['vs_prev_close']:+.2f}% ({m['phase']})",
             "high",
             "warning",
         ))
@@ -169,45 +244,54 @@ def evaluate(m, daily_drop, drawdown, rearm, state, force):
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--symbols", default=env("SYMBOLS", "QQQ"))
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("--symbols", default=env("SYMBOLS", "QQQ"),
+                   help="SYM[:daily_drop[:drawdown]] separated by commas")
     p.add_argument("--daily-drop", type=float, default=float(env("DAILY_DROP", "2.0")),
-                   help="percent below previous close that triggers rule 1")
+                   help="default percent below the previous close for rule 1")
     p.add_argument("--drawdown", type=float, default=float(env("DRAWDOWN", "8.0")),
-                   help="percent below the trailing peak that triggers rule 2")
+                   help="default percent below the trailing peak for rule 2")
     p.add_argument("--peak-days", type=int, default=int(env("PEAK_DAYS", "60")),
                    help="length of the trailing window for the peak")
     p.add_argument("--rearm", type=float, default=float(env("REARM", "2.0")),
-                   help="recovery needed above the drawdown line before rule 2 can fire again")
-    p.add_argument("--dry-run", action="store_true", help="print, do not notify, do not save state")
+                   help="recovery above the drawdown line before rule 2 can fire again")
+    p.add_argument("--no-extended", dest="extended", action="store_false",
+                   help="ignore pre- and post-market trading")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print, do not notify, do not save state")
     p.add_argument("--force", action="store_true", help="ignore dedup and notify anyway")
+    p.set_defaults(extended=env("EXTENDED", "1") not in ("0", "false", "no"))
     args = p.parse_args()
 
     topic = env("NTFY_TOPIC", "")
     state = load_state()
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     sent = 0
 
-    for symbol in symbols:
-        m = measure(symbol, args.peak_days)
+    for symbol, daily_drop, drawdown in parse_specs(
+        args.symbols, args.daily_drop, args.drawdown
+    ):
+        m = measure(symbol, args.peak_days, args.extended)
         if m is None:
             print(f"{symbol}: no data")
             continue
 
-        stale = "" if m["is_today"] else "  [market closed, last session]"
+        stamp = m["as_of"] or m["session"]
+        stale = "" if m["is_today"] else "   [ultima sesion disponible]"
         print(
-            f"{m['symbol']} {m['session']}{stale}\n"
-            f"  price          {m['price']:10.2f}\n"
-            f"  vs prev close  {m['vs_prev_close']:+10.2f}%   (gap {m['gap']:+.2f}%"
-            f" + intraday {m['vs_open']:+.2f}%)\n"
-            f"  from {args.peak_days}d peak  {m['from_peak']:+10.2f}%   "
-            f"(peak {m['peak_close']:.2f} on {m['peak_date']})"
+            f"{m['symbol']}  {stamp}  {m['phase']}{stale}\n"
+            f"  precio            {m['price']:10.2f}\n"
+            f"  vs cierre previo  {m['vs_prev_close']:+10.2f}%   ({split_text(m)})"
+            f"   umbral {-daily_drop:.1f}%\n"
+            f"  vs max {args.peak_days}d       {m['from_peak']:+10.2f}%   "
+            f"(max {m['peak_close']:.2f} del {m['peak_date']})   umbral {-drawdown:.1f}%"
         )
 
         for state_key, state_value, title, body, priority, tags in evaluate(
-            m, args.daily_drop, args.drawdown, args.rearm, state, args.force
+            m, daily_drop, drawdown, args.rearm, state, args.force
         ):
-            print(f"  ALERT -> {title}")
+            print(f"  ALERTA -> {title}")
             if args.dry_run:
                 continue
             if notify(topic, title, body, priority, tags):
@@ -220,7 +304,7 @@ def main():
         state["last_run_date"] = datetime.now(NY).date().isoformat()
         save_state(state)
 
-    print(f"\n{sent} notification(s) sent")
+    print(f"\n{sent} notificacion(es) enviada(s)")
     return 0
 
 

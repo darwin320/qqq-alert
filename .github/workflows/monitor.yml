@@ -1,12 +1,15 @@
 name: monitor
 
 on:
-  # Every 30 minutes, weekdays. Cron here is UTC: 13-21 covers the US cash
-  # session in both EDT (13:30-20:00) and EST (14:30-21:00). Runs that land
-  # outside the session just report the last close and alert nothing.
+  # Every 30 minutes, weekdays. Cron here is UTC. 11-23 covers pre-market from
+  # about 07:00 ET, the whole cash session, and after-hours, in both EDT and
+  # EST. Pre-market matters: that is where the overnight gap forms, and the
+  # point of this bot is to see it forming instead of at 09:30.
+  # Winter edge: after-hours runs to 20:00 EST = 01:00 UTC, so the last hour
+  # is not covered between November and March.
   # GitHub schedules are best effort and can be delayed under load.
   schedule:
-    - cron: '*/30 13-21 * * 1-5'
+    - cron: '*/30 11-23 * * 1-5'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -36,6 +39,7 @@ jobs:
           DAILY_DROP: ${{ vars.DAILY_DROP || '2.0' }}
           DRAWDOWN: ${{ vars.DRAWDOWN || '8.0' }}
           PEAK_DAYS: ${{ vars.PEAK_DAYS || '60' }}
+          EXTENDED: ${{ vars.EXTENDED || '1' }}
         run: python monitor.py ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: Persist alert state
