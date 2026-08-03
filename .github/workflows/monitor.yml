@@ -7,9 +7,14 @@ on:
   # point of this bot is to see it forming instead of at 09:30.
   # Winter edge: after-hours runs to 20:00 EST = 01:00 UTC, so the last hour
   # is not covered between November and March.
-  # GitHub schedules are best effort and can be delayed under load.
+  #
+  # Minutes 7 and 37, NOT 0 and 30. GitHub schedules are best effort and the
+  # queue is worst at the top of the hour and the half hour, where most cron
+  # expressions land. Measured on 2026-08-03 with '*/30': of the six due runs
+  # between 11:00 and 13:30 UTC only one fired, and 3 minutes late. Odd
+  # minutes sit outside the congestion peak.
   schedule:
-    - cron: '*/30 11-23 * * 1-5'
+    - cron: '7,37 11-23 * * 1-5'
   workflow_dispatch:
     inputs:
       dry_run:
