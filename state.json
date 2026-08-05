@@ -1,5 +1,5 @@
 {
-  "NOW:drawdown_active": false,
+  "NOW:drawdown_active": true,
   "QQQ:daily_drop": "2026-08-03",
   "QQQ:drawdown_active": false,
   "TLT:drawdown_active": true,
