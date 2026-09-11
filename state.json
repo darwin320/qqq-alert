@@ -1,6 +1,6 @@
 {
   "MOAT:daily_drop": "2026-08-28",
-  "MOAT:drawdown_active": true,
+  "MOAT:drawdown_active": false,
   "NOW:daily_drop": "2026-09-08",
   "NOW:drawdown_active": false,
   "QQQ:daily_drop": "2026-08-12",
